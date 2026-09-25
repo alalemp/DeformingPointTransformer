@@ -25,6 +25,9 @@ Usage:
   python tools/visualize_seg.py --id s0852 --out vis/s0852
   python tools/visualize_seg.py --id s0852 --organs liver spleen kidney_left kidney_right pancreas \
       --prepared data/tsmri --out vis/s0852
+  # plus a trained model's prediction and its template (main.py must have written predictions.npz)
+  python tools/visualize_seg.py --id s0175 --organs liver spleen kidney_left kidney_right pancreas \
+      --prepared data/tsmri --results results/tsmri_b8 --out vis/s0175_pred
 """
 import glob
 import argparse
@@ -182,26 +185,65 @@ def load_totalseg(data, sid, organs):
     return img_nii, seg, labels, sid
 
 
-def prepared_traces(prep_dir, sid, organs, colors):
-    """Point clouds written by prepare_totalseg_mri.py, mapped back to world mm."""
+def to_world_mm(p, aff):
+    """Normalised [-1, 1] points -> world mm (inverse of the normalisation, as convert_to_mm)."""
+    import prepare_totalseg_mri as prep
+    d = np.array(prep.GRID_SHAPE, dtype=np.float64) - 1
+    v = (p.astype(np.float64) + 1) / 2 * d
+    v[:, :2] = d[:2] - v[:, :2]
+    return v @ aff[:3, :3].T + aff[:3, 3]
+
+
+def point_trace(w, name, color, visible="legendonly", size=1.5):
+    return {"type": "scatter3d", "mode": "markers", "name": name, "visible": visible,
+            "x": np.round(w[:, 0], 1).tolist(), "y": np.round(w[:, 1], 1).tolist(),
+            "z": np.round(w[:, 2], 1).tolist(), "marker": {"size": size, "color": color}}
+
+
+def prepared_organs(prep_dir):
+    with open(glob.glob(os.path.join(prep_dir, "labels", "*.json"))[0]) as f:
+        return {int(k): v for k, v in json.load(f).items()}
+
+
+def prepared_traces(prep_dir, sid, colors, world=lambda w: w):
+    """Input and target point clouds written by prepare_*.py, mapped back to world mm."""
     data, affines = np.load(os.path.join(prep_dir, "data.npz")), np.load(os.path.join(prep_dir, "affines.npz"))
     if sid not in affines:
         print(f"{sid} is not in {prep_dir} (not selected?) - no prepared points shown")
         return []
-    aff = affines[sid]
-    with open(glob.glob(os.path.join(prep_dir, "labels", "*.json"))[0]) as f:
-        prep_organs = list(json.load(f).values())
-    import prepare_totalseg_mri as prep
-    d = np.array(prep.GRID_SHAPE, dtype=np.float32) - 1
+    traces = [point_trace(world(to_world_mm(data[f"{sid}__input_points"], affines[sid])), "points: input surface", "#806040")]
+    for o in prepared_organs(prep_dir).values():
+        traces.append(point_trace(world(to_world_mm(data[f"{sid}__{o}"], affines[sid])), f"points: target {o}",
+                                  colors.get(o, "#000000")))
+    return traces
+
+
+def find_prediction(prep_dir, results, sid):
+    """(predictions (N,3), dir holding the template used) for sid: in results/ or results/fold_*/."""
+    for d in [results] + sorted(glob.glob(os.path.join(results, "fold_*"))):
+        f = os.path.join(d, "predictions.npz")
+        if os.path.isfile(f) and sid in np.load(f).files:
+            fold = os.path.join(prep_dir, "folds", os.path.basename(d))
+            return np.load(f)[sid], (fold if os.path.isdir(fold) else prep_dir)
+    return None, None
+
+
+def prediction_traces(prep_dir, results, sid, colors, world=lambda w: w):
+    """Model prediction and the template it started from, per organ, in world mm."""
+    pred, split_dir = find_prediction(prep_dir, results, sid)
+    if pred is None:
+        print(f"no prediction for {sid} under {results} (is it a test sample there?)")
+        return []
+    aff = np.load(os.path.join(prep_dir, "affines.npz"))[sid]
+    mean = np.load(os.path.join(split_dir, "mean_shape.npz"))
+    organs = prepared_organs(prep_dir)
+    keep = np.isin(mean["mean_label_np"], list(organs))
+    tmpl, lab = mean["mean_pc_np"][keep], mean["mean_label_np"][keep]
     traces = []
-    for key, color in [("input_points", "#806040")] + [(o, colors.get(o, "#000000")) for o in prep_organs]:
-        p = data[f"{sid}__{key}"]
-        v = (p + 1) / 2 * d
-        v[:, :2] = d[:2] - v[:, :2]
-        w = v @ aff[:3, :3].T + aff[:3, 3]
-        traces.append({"type": "scatter3d", "mode": "markers", "name": f"points: {key}", "visible": "legendonly",
-                       "x": np.round(w[:, 0], 1).tolist(), "y": np.round(w[:, 1], 1).tolist(),
-                       "z": np.round(w[:, 2], 1).tolist(), "marker": {"size": 1.5, "color": color}})
+    for li, o in organs.items():
+        c = colors.get(o, "#000000")
+        traces.append(point_trace(world(to_world_mm(pred[lab == li], aff)), f"predicted {o}", c, visible=True, size=2))
+        traces.append(point_trace(world(to_world_mm(tmpl[lab == li], aff)), f"template {o}", c))
     return traces
 
 
@@ -213,6 +255,7 @@ def main():
     ap.add_argument("--data", default=DEFAULT_DATA, help="TotalSegmentator MRI dataset root (with --id)")
     ap.add_argument("--organs", nargs="*", help="with --id: organ names to show (default: all masks)")
     ap.add_argument("--prepared", help="with --id: output dir of prepare_totalseg_mri.py to overlay points")
+    ap.add_argument("--results", help="with --prepared: main.py --save_path (predictions.npz) to overlay predictions")
     ap.add_argument("--out", required=True, help="output prefix (without extension)")
     ap.add_argument("--labels", type=int, nargs="*", help="label ids to show (default: main organs)")
     ap.add_argument("--body_step", type=int, default=2, help="marching-cubes step for the body (bigger = smaller file)")
@@ -252,7 +295,9 @@ def main():
         v, f = mesh_world(seg == l, affine, step=args.organ_step)
         traces.append(mesh_trace(v, f, name, colors[name], 1.0))
     if args.prepared:
-        traces += prepared_traces(args.prepared, args.id, args.organs, colors)
+        traces += prepared_traces(args.prepared, args.id, colors)
+        if args.results:
+            traces += prediction_traces(args.prepared, args.results, args.id, colors)
     write_html(traces, args.out + ".html", title)
     write_png(img, body, seg, labels, args.out + ".png", zooms)
     print(f"wrote {args.out}.html and {args.out}.png")

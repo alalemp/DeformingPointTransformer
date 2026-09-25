@@ -42,11 +42,6 @@ cfg_decoder.blocks = cfg_body.blocks[::-1]
 cfg_decoder.share_planes = cfg_body.share_planes
 cfg_decoder.nsample = cfg_body.nsample[::-1]
 
-print(cfg_mean)
-print(cfg_body)
-print(cfg_decoder)
-
-model = Model(cfg_mean, cfg_body, cfg_decoder, c=c, k=k)
 
 import argparse
 
@@ -62,6 +57,10 @@ parser.add_argument("--save_path", type=str, required=True, default="", help="Pa
 parser.add_argument("--which_label",type=str,required=True,default="",help="Which label set to use")
 parser.add_argument("--batch_size",type=int,default=16,help="Batch size")
 parser.add_argument("--epochs",type=int,default=100,help="Maximum number of epochs")
+parser.add_argument("--residual",action="store_true",help="Predict template + residual_scale * correction instead of absolute coordinates")
+parser.add_argument("--residual_scale",type=float,default=0.02,help="Size of a unit correction in normalised coordinates (--residual)")
+parser.add_argument("--bn_recalibrate",action=argparse.BooleanOptionalAction,default=True,help="Recompute BatchNorm running statistics on the training set before evaluating")
+parser.add_argument("--eval_only",action="store_true",help="Skip training; evaluate models/model_weights_best.pth in --save_path")
 
 args = parser.parse_args()
 B = args.batch_size
@@ -104,16 +103,43 @@ data_root = args.data_root
 if os.path.exists(data_root):
 	loaded = np.load(data_root)
 	data = {}
-	for k in loaded.files:
-		main, sub = k.split("__")
-		data.setdefault(main, {})[sub] = loaded[k]
+	for key in loaded.files:
+		main, sub = key.split("__")
+		data.setdefault(main, {})[sub] = loaded[key]
 		
 print(label_organs)
 
-N_in = 16384
-N_points = 4096
-N_classes = 5
+# sizes from the data: body points per subject, points per organ, number of organs
+first_patient = data[train_patient_list[0]]
+N_in = first_patient["input_points"].shape[0]
+N_points = first_patient[next(iter(label_organs.values()))].shape[0]
+N_classes = len(label_organs)
 N_out = N_points * N_classes
+assert len(init_mean) == N_out, f"mean shape has {len(init_mean)} points after label filtering, expected {N_out}"
+
+# the two encoders are fused point-wise at the bottleneck, so both must reach the same
+# number of points: N_in / prod(body strides) == N_out / prod(mean strides). The first
+# downsampling stride of the mean encoder is set to make this hold.
+bottleneck = N_in // int(np.prod(cfg_body.stride))
+cfg_mean.stride[1] = N_out // (bottleneck * int(np.prod(cfg_mean.stride[2:])))
+assert N_in == bottleneck * int(np.prod(cfg_body.stride)) and N_out == bottleneck * int(np.prod(cfg_mean.stride)), \
+	f"cannot match encoder bottlenecks for N_in={N_in}, N_out={N_out}; adjust the strides"
+
+print(cfg_mean)
+print(cfg_body)
+print(cfg_decoder)
+
+model = Model(cfg_mean, cfg_body, cfg_decoder, c=c, k=k)
+if args.residual:
+	# zero-initialise the last layer: an untrained model returns the template exactly
+	torch.nn.init.zeros_(model.cls[-1].weight)
+	torch.nn.init.zeros_(model.cls[-1].bias)
+
+def predict(body_coord, body_offset, mean_coord, mean_offset):
+	"""Model output; with --residual a correction of each template point, so output point i stays
+	template point i moved (needed e.g. for tools/volume_eval.py)."""
+	out = model([body_coord, body_coord, body_offset], [mean_coord, mean_coord, mean_offset])
+	return mean_coord + args.residual_scale * out if args.residual else out
 
 train_input_points = torch.zeros((len(train_patient_list), N_in, 3), dtype=torch.float32)
 train_target_points = torch.zeros((len(train_patient_list), N_out, 3), dtype=torch.float32)
@@ -133,11 +159,6 @@ for patient_id in train_patient_list:
 	train_target_points[train_patient_list.index(patient_id)] = patient_target_points
 	train_target_labels[train_patient_list.index(patient_id)] = patient_target_labels
 	
-N_in = 16384
-N_points = 4096
-N_classes = 5
-N_out = N_points * N_classes
-
 test_input_points = torch.zeros((len(test_patient_list), N_in, 3), dtype=torch.float32)
 test_target_points = torch.zeros((len(test_patient_list), N_out, 3), dtype=torch.float32)
 test_target_labels = torch.zeros((len(test_patient_list), N_out), dtype=torch.int64)
@@ -259,7 +280,7 @@ train_data = NAKO_10k_All_Dataset(input_points=train_input_points,	output_points
 train_loader = torch.utils.data.DataLoader(train_data, batch_size=B, shuffle=True, drop_last=True, collate_fn=collate_fn)
 
 test_data = NAKO_10k_All_Dataset(input_points=test_input_points,	output_points=test_target_points,	output_labels=test_target_labels,	init_mean=init_mean,	init_labels=init_mean_labels,	conversion=conversion,	patient_ids=test_patient_list,	img_path="../../../../eytankats/data/nako_10k/images_mri_stitched/")
-test_loader = torch.utils.data.DataLoader(test_data, batch_size=B, shuffle=False, drop_last=True, collate_fn=collate_fn)
+test_loader = torch.utils.data.DataLoader(test_data, batch_size=B, shuffle=False, drop_last=False, collate_fn=collate_fn)
 
 from util.chamfer_loss import calc_chamfer_stacked_objectwise as criterion
 from torch.optim import Adam
@@ -270,57 +291,58 @@ scheduler = MultiStepLR(optimizer, milestones=[25, 50, 75], gamma=0.3)
 
 from tqdm import tqdm
 
-best_loss = float("inf")
-total_epoch = args.epochs
-loss_epoch = np.zeros((total_epoch,), dtype=np.float32)
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 model = model.to(device)
-model.train()
-early_stop_counter = 0
-for epoch in range(1,total_epoch+1):
-	print(f"Epoch {epoch}/{total_epoch}")
-	avg_loss = 0.0
-	for i, (body_coord, body_offset, mean_coord, mean_labels, mean_offset, target_coord, target_labels, target_offset, transform_matrix, patient_path) in enumerate(tqdm(train_loader)): 
-		body_coord, body_offset = body_coord.to(device), body_offset.to(device)
-		mean_coord, mean_labels, mean_offset = mean_coord.to(device), mean_labels.to(device), mean_offset.to(device)
-		target_coord, target_labels = target_coord.to(device), target_labels.to(device)
+if not args.eval_only:
+	best_loss = float("inf")
+	total_epoch = args.epochs
+	loss_epoch = np.zeros((total_epoch,), dtype=np.float32)
+	model.train()
+	early_stop_counter = 0
+	for epoch in range(1,total_epoch+1):
+		print(f"Epoch {epoch}/{total_epoch}")
+		avg_loss = 0.0
+		for i, (body_coord, body_offset, mean_coord, mean_labels, mean_offset, target_coord, target_labels, target_offset, transform_matrix, patient_path) in enumerate(tqdm(train_loader)): 
+			body_coord, body_offset = body_coord.to(device), body_offset.to(device)
+			mean_coord, mean_labels, mean_offset = mean_coord.to(device), mean_labels.to(device), mean_offset.to(device)
+			target_coord, target_labels = target_coord.to(device), target_labels.to(device)
 		
-		output_coord = model([body_coord, body_coord, body_offset], [mean_coord, mean_coord, mean_offset])
+			output_coord = predict(body_coord, body_offset, mean_coord, mean_offset)
 
-		loss = criterion(output_coord, target_coord, mean_labels, target_labels, B)
-		optimizer.zero_grad()
-		loss.backward()
-		optimizer.step()
+			loss = criterion(output_coord, target_coord, mean_labels, target_labels, B)
+			optimizer.zero_grad()
+			loss.backward()
+			optimizer.step()
 		
-		avg_loss += loss.item()
+			avg_loss += loss.item()
 	
-	avg_loss /= len(train_loader)
-	print(f"Avg Loss - {avg_loss:.6f}")
-	loss_epoch[epoch-1] = avg_loss
-	if avg_loss <= best_loss:
-		print("New best result")
-		best_loss = avg_loss
-		torch.save(model.state_dict(), f"{model_save_path}/model_weights_best.pth")
-		early_stop_counter = 0
-	else:
-		early_stop_counter += 1
-		print(f"Best loss remains - {best_loss:.6f} - Early stop counter: {early_stop_counter}")
+		avg_loss /= len(train_loader)
+		print(f"Avg Loss - {avg_loss:.6f}")
+		loss_epoch[epoch-1] = avg_loss
+		if avg_loss <= best_loss:
+			print("New best result")
+			best_loss = avg_loss
+			torch.save(model.state_dict(), f"{model_save_path}/model_weights_best.pth")
+			early_stop_counter = 0
+		else:
+			early_stop_counter += 1
+			print(f"Best loss remains - {best_loss:.6f} - Early stop counter: {early_stop_counter}")
 	
-	if early_stop_counter >= 6:
-		print("Early stopping triggered.")
-		break
+		if early_stop_counter >= 6:
+			print("Early stopping triggered.")
+			break
 		
-	scheduler.step()
+		scheduler.step()
 
-torch.save(model.state_dict(), f"{model_save_path}/model_weights_last.pth")
+	torch.save(model.state_dict(), f"{model_save_path}/model_weights_last.pth")
 
-fig = plt.figure(figsize=(8,8))
-ax = fig.add_subplot(111)
-ax.plot(loss_epoch)
-ax.set_title("Running Loss over Epoch")
-ax.set_xlabel("Epoch")
-ax.set_ylabel("CD Loss")
-plt.savefig(f"{fig_save_path}/Running Loss")
+	fig = plt.figure(figsize=(8,8))
+	ax = fig.add_subplot(111)
+	ax.plot(loss_epoch)
+	ax.set_title("Running Loss over Epoch")
+	ax.set_xlabel("Epoch")
+	ax.set_ylabel("CD Loss")
+	plt.savefig(f"{fig_save_path}/Running Loss")
 
 import pandas as pd
 from util.evaluation_functions import evaluate
@@ -330,12 +352,29 @@ torch.cuda.empty_cache()
 
 model.load_state_dict(torch.load(f"{model_save_path}/model_weights_best.pth"))
 
+def recalibrate_bn(loader):
+	"""Recompute BatchNorm running statistics with the final weights, as a cumulative average over
+	the training batches. With small batches the running averages kept during training can drift far
+	from the batch statistics the weights were trained with, which corrupts eval-mode predictions."""
+	for m in model.modules():
+		if isinstance(m, torch.nn.modules.batchnorm._BatchNorm):
+			m.reset_running_stats()
+			m.momentum = None
+	model.train()
+	with torch.no_grad():
+		for body_coord, body_offset, mean_coord, mean_labels, mean_offset, *_ in loader:
+			predict(body_coord.to(device), body_offset.to(device), mean_coord.to(device), mean_offset.to(device))
+
+if args.bn_recalibrate:
+	recalibrate_bn(train_loader)
+
 all_metrics = {"cd": {}, "hd95": {}, "max_width": {}, "min_width": {}, "max_depth": {}, "min_depth": {}, "max_height": {}, "min_height": {}}
 for metric, metric_results in all_metrics.items():
 	for label, organ in label_organs.items():
 		metric_results[organ] = 0.0
 
 cd, hd95 = 0.0, 0.0
+predictions = []
 model.eval()
     
 with torch.no_grad():
@@ -344,33 +383,38 @@ with torch.no_grad():
 		mean_coord, mean_labels, mean_offset = mean_coord.to(device), mean_labels.to(device), mean_offset.to(device)
 		target_coord, target_labels = target_coord.to(device), target_labels.to(device)
 
-		output_coord = model([body_coord, body_coord, body_offset], [mean_coord, mean_coord, mean_offset])
+		output_coord = predict(body_coord, body_offset, mean_coord, mean_offset)
 			
-		results = evaluate(output_coord.detach(), target_coord, mean_labels, target_labels, batch_size=B, affine=transform_matrix[0], device=device)
+		nb = len(body_offset)
+		for r in range(nb):
+			b0 = 0 if r == 0 else mean_offset[r - 1].item()
+			predictions.append(output_coord[b0:mean_offset[r].item()].cpu().numpy())
+		results = evaluate(output_coord.detach(), target_coord, mean_labels, target_labels, batch_size=nb, affine=transform_matrix[0], device=device)
 
-		cd += results["total_cd"]
-		hd95 += results["total_hd95"]
+		cd += nb * results["total_cd"]
+		hd95 += nb * results["total_hd95"]
 
 		for idx, (label, organ) in enumerate(label_organs.items()):
-			all_metrics["cd"][organ] += results["per_organ_cd"][idx]
-			all_metrics["hd95"][organ] += results["per_organ_hd95"][idx]
-			all_metrics["max_width"][organ] += results["max_error_mm"][idx, 0]
-			all_metrics["max_depth"][organ] += results["max_error_mm"][idx, 1]
-			all_metrics["max_height"][organ] += results["max_error_mm"][idx, 2]
-			all_metrics["min_width"][organ] += results["min_error_mm"][idx, 0]
-			all_metrics["min_depth"][organ] += results["min_error_mm"][idx, 1]
-			all_metrics["min_height"][organ] += results["min_error_mm"][idx, 2]
+			all_metrics["cd"][organ] += nb * results["per_organ_cd"][idx]
+			all_metrics["hd95"][organ] += nb * results["per_organ_hd95"][idx]
+			all_metrics["max_width"][organ] += nb * results["max_error_mm"][idx, 0]
+			all_metrics["max_depth"][organ] += nb * results["max_error_mm"][idx, 1]
+			all_metrics["max_height"][organ] += nb * results["max_error_mm"][idx, 2]
+			all_metrics["min_width"][organ] += nb * results["min_error_mm"][idx, 0]
+			all_metrics["min_depth"][organ] += nb * results["min_error_mm"][idx, 1]
+			all_metrics["min_height"][organ] += nb * results["min_error_mm"][idx, 2]
 
-	cd /= len(test_loader)
-	hd95 /= len(test_loader)
+	cd /= len(test_data)
+	hd95 /= len(test_data)
 
 	for metric, metric_results in all_metrics.items():
 		for label, organ in label_organs.items():
-			metric_results[organ] /= len(test_loader)
+			metric_results[organ] /= len(test_data)
 
 	all_metrics = {metric: {organ: value.item() for organ, value in metric_results.items()} for metric, metric_results in all_metrics.items()}
 	metrics_df = pd.DataFrame(all_metrics)
 	metrics_df.to_csv(f"{csv_save_path}/trained_vs_target_{which_label}.csv")
+	np.savez(f"{save_path}/predictions.npz", **dict(zip(test_patient_list, predictions)))
 
 	import random
 
@@ -405,33 +449,36 @@ with torch.no_grad():
 
 		plt.savefig(f"{fig_save_path}/Output Results - {r+1}")
 
-	
+# reset accumulators: otherwise the template metrics include half of the trained-model metrics
+all_metrics = {metric: {organ: 0.0 for organ in label_organs.values()} for metric in all_metrics}
+cd, hd95 = 0.0, 0.0
 for i, (body_coord, body_offset, mean_coord, mean_labels, mean_offset, target_coord, target_labels, target_offset, transform_matrix, patient_path) in enumerate(tqdm(test_loader)): 
 	body_coord, body_offset = body_coord.to(device), body_offset.to(device)
 	mean_coord, mean_labels, mean_offset = mean_coord.to(device), mean_labels.to(device), mean_offset.to(device)
 	target_coord, target_labels = target_coord.to(device), target_labels.to(device)
 		
-	results = evaluate(mean_coord, target_coord, mean_labels, target_labels, batch_size=B, affine=transform_matrix[0], device=device)
+	nb = len(body_offset)
+	results = evaluate(mean_coord, target_coord, mean_labels, target_labels, batch_size=nb, affine=transform_matrix[0], device=device)
 
-	cd += results["total_cd"]
-	hd95 += results["total_hd95"]
+	cd += nb * results["total_cd"]
+	hd95 += nb * results["total_hd95"]
 
 	for idx, (label, organ) in enumerate(label_organs.items()):
-		all_metrics["cd"][organ] += results["per_organ_cd"][idx]
-		all_metrics["hd95"][organ] += results["per_organ_hd95"][idx]
-		all_metrics["max_width"][organ] += results["max_error_mm"][idx, 0]
-		all_metrics["max_depth"][organ] += results["max_error_mm"][idx, 1]
-		all_metrics["max_height"][organ] += results["max_error_mm"][idx, 2]
-		all_metrics["min_width"][organ] += results["min_error_mm"][idx, 0]
-		all_metrics["min_depth"][organ] += results["min_error_mm"][idx, 1]
-		all_metrics["min_height"][organ] += results["min_error_mm"][idx, 2]
+		all_metrics["cd"][organ] += nb * results["per_organ_cd"][idx]
+		all_metrics["hd95"][organ] += nb * results["per_organ_hd95"][idx]
+		all_metrics["max_width"][organ] += nb * results["max_error_mm"][idx, 0]
+		all_metrics["max_depth"][organ] += nb * results["max_error_mm"][idx, 1]
+		all_metrics["max_height"][organ] += nb * results["max_error_mm"][idx, 2]
+		all_metrics["min_width"][organ] += nb * results["min_error_mm"][idx, 0]
+		all_metrics["min_depth"][organ] += nb * results["min_error_mm"][idx, 1]
+		all_metrics["min_height"][organ] += nb * results["min_error_mm"][idx, 2]
 
-cd /= len(test_loader)
-hd95 /= len(test_loader)
+cd /= len(test_data)
+hd95 /= len(test_data)
 
 for metric, metric_results in all_metrics.items():
 	for label, organ in label_organs.items():
-		metric_results[organ] /= len(test_loader)
+		metric_results[organ] /= len(test_data)
 
 all_metrics = {metric: {organ: value.item() for organ, value in metric_results.items()} for metric, metric_results in all_metrics.items()}
 metrics_df = pd.DataFrame(all_metrics)
