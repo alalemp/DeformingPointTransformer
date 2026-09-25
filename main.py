@@ -60,8 +60,11 @@ parser.add_argument("--init_mean_shape_path",type=str,required=True,default="",h
 parser.add_argument("--conversion_path",type=str,required=True,default="",help="Conversion file path for affine transformations")
 parser.add_argument("--save_path", type=str, required=True, default="", help="Path to save results")
 parser.add_argument("--which_label",type=str,required=True,default="",help="Which label set to use")
+parser.add_argument("--batch_size",type=int,default=16,help="Batch size")
+parser.add_argument("--epochs",type=int,default=100,help="Maximum number of epochs")
 
 args = parser.parse_args()
+B = args.batch_size
 
 
 training_patient_list_file   = args.training_list_file_path
@@ -268,7 +271,7 @@ scheduler = MultiStepLR(optimizer, milestones=[25, 50, 75], gamma=0.3)
 from tqdm import tqdm
 
 best_loss = float("inf")
-total_epoch = 100
+total_epoch = args.epochs
 loss_epoch = np.zeros((total_epoch,), dtype=np.float32)
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 model = model.to(device)
