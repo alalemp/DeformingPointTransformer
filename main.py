@@ -1,4 +1,5 @@
 import os
+import sys
 import json
 import numpy as np
 import torch, gc
@@ -49,6 +50,7 @@ parser = argparse.ArgumentParser()
 
 parser.add_argument("--training_list_file_path",type=str,required=True,default="",help="Training Set patient list file path")
 parser.add_argument("--testing_list_file_path",type=str,required=True,default="",help="Testing Set patient file path")
+parser.add_argument("--validation_list_file_path",type=str,default="",help="Validation Set patient file path (optional): the checkpoint is then chosen, and early stopping decided, on the validation loss")
 parser.add_argument("--label_json_file_path",type=str,required=True,default="",help="JSON file path for label organs")
 parser.add_argument("--data_root",type=str,required=True,default="",help="Data root path (For loading point clouds)")
 parser.add_argument("--init_mean_shape_path",type=str,required=True,default="",help="Init mean shape file path")
@@ -57,12 +59,24 @@ parser.add_argument("--save_path", type=str, required=True, default="", help="Pa
 parser.add_argument("--which_label",type=str,required=True,default="",help="Which label set to use")
 parser.add_argument("--batch_size",type=int,default=16,help="Batch size")
 parser.add_argument("--epochs",type=int,default=100,help="Maximum number of epochs")
+parser.add_argument("--lr",type=float,default=1e-3,help="Adam learning rate")
+parser.add_argument("--milestones",type=str,default="25,50,75",help="Epochs at which the learning rate is multiplied by --gamma (comma separated, empty for none)")
+parser.add_argument("--gamma",type=float,default=0.3,help="Learning-rate decay factor at each milestone")
+parser.add_argument("--patience",type=int,default=6,help="Stop after this many epochs without a new best loss - validation loss if a validation set is given, else training loss (0 = never stop early)")
+parser.add_argument("--monitor_test",action="store_true",help="Report test loss and test CD (mm, model vs template) after every epoch")
 parser.add_argument("--residual",action="store_true",help="Predict template + residual_scale * correction instead of absolute coordinates")
 parser.add_argument("--residual_scale",type=float,default=0.02,help="Size of a unit correction in normalised coordinates (--residual)")
 parser.add_argument("--bn_recalibrate",action=argparse.BooleanOptionalAction,default=True,help="Recompute BatchNorm running statistics on the training set before evaluating")
+parser.add_argument("--seed",type=int,default=0,help="Random seed (python, numpy, torch)")
 parser.add_argument("--eval_only",action="store_true",help="Skip training; evaluate models/model_weights_best.pth in --save_path")
 
 args = parser.parse_args()
+# fixed seeds for repeatable runs (CUDA kernels such as pointops can still differ slightly between runs)
+import random
+random.seed(args.seed)
+np.random.seed(args.seed)
+torch.manual_seed(args.seed)
+torch.cuda.manual_seed_all(args.seed)
 B = args.batch_size
 
 
@@ -177,6 +191,21 @@ for patient_id in test_patient_list:
 	test_target_points[test_patient_list.index(patient_id)] = patient_target_points
 	test_target_labels[test_patient_list.index(patient_id)] = patient_target_labels
 	
+# optional validation set (checkpoint selection / early stopping), built like the test set
+val_patient_list = []
+if args.validation_list_file_path:
+	with open(args.validation_list_file_path) as f:
+		val_patient_list = [line.strip() for line in f if line.strip()]
+val_input_points = torch.zeros((len(val_patient_list), N_in, 3), dtype=torch.float32)
+val_target_points = torch.zeros((len(val_patient_list), N_out, 3), dtype=torch.float32)
+val_target_labels = torch.zeros((len(val_patient_list), N_out), dtype=torch.int64)
+for k_val, patient_id in enumerate(val_patient_list):
+	patient_data = data[patient_id]
+	for idx, (label, organ) in enumerate(label_organs.items()):
+		val_target_points[k_val, idx * N_points:(idx + 1) * N_points] = torch.from_numpy(patient_data[organ])
+		val_target_labels[k_val, idx * N_points:(idx + 1) * N_points] = int(label)
+	val_input_points[k_val] = torch.from_numpy(patient_data['input_points'])
+
 conversion_path = args.conversion_path
 
 if os.path.exists(conversion_path):
@@ -281,28 +310,60 @@ train_loader = torch.utils.data.DataLoader(train_data, batch_size=B, shuffle=Tru
 
 test_data = NAKO_10k_All_Dataset(input_points=test_input_points,	output_points=test_target_points,	output_labels=test_target_labels,	init_mean=init_mean,	init_labels=init_mean_labels,	conversion=conversion,	patient_ids=test_patient_list,	img_path="../../../../eytankats/data/nako_10k/images_mri_stitched/")
 test_loader = torch.utils.data.DataLoader(test_data, batch_size=B, shuffle=False, drop_last=False, collate_fn=collate_fn)
+val_loader = None
+if val_patient_list:
+	val_data = NAKO_10k_All_Dataset(input_points=val_input_points, output_points=val_target_points, output_labels=val_target_labels, init_mean=init_mean, init_labels=init_mean_labels, conversion=conversion, patient_ids=val_patient_list, img_path="")
+	val_loader = torch.utils.data.DataLoader(val_data, batch_size=B, shuffle=False, drop_last=False, collate_fn=collate_fn)
+	print(f"validation set: {len(val_patient_list)} samples - checkpoint and early stopping on validation loss")
 
 from util.chamfer_loss import calc_chamfer_stacked_objectwise as criterion
 from torch.optim import Adam
 from torch.optim.lr_scheduler import MultiStepLR
 
-optimizer = Adam(model.parameters(), lr=1e-3)
-scheduler = MultiStepLR(optimizer, milestones=[25, 50, 75], gamma=0.3)
+optimizer = Adam(model.parameters(), lr=args.lr)
+scheduler = MultiStepLR(optimizer, milestones=[int(m) for m in args.milestones.split(",") if m.strip()], gamma=args.gamma)
 
 from tqdm import tqdm
+import pandas as pd
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 model = model.to(device)
+from util.evaluation_functions import evaluate
+
+def monitor(loader):
+	"""Loss and mean CD (mm) of the model and of the template on a loader. BatchNorm uses each batch's
+	own statistics, as in training; the running statistics are left untouched (momentum 0)."""
+	bns = [m for m in model.modules() if isinstance(m, torch.nn.modules.batchnorm._BatchNorm)]
+	saved = [m.momentum for m in bns]
+	for m in bns:
+		m.momentum = 0.0
+	model.train()
+	loss, cd, cd_template, n = 0.0, 0.0, 0.0, 0
+	with torch.no_grad():
+		for body_coord, body_offset, mean_coord, mean_labels, mean_offset, target_coord, target_labels, target_offset, transform_matrix, patient_path in loader:
+			body_coord, body_offset = body_coord.to(device), body_offset.to(device)
+			mean_coord, mean_labels, mean_offset = mean_coord.to(device), mean_labels.to(device), mean_offset.to(device)
+			target_coord, target_labels = target_coord.to(device), target_labels.to(device)
+			nb = len(body_offset)
+			output_coord = predict(body_coord, body_offset, mean_coord, mean_offset)
+			loss += nb * criterion(output_coord, target_coord, mean_labels, target_labels, nb).item()
+			cd += nb * evaluate(output_coord, target_coord, mean_labels, target_labels, batch_size=nb, affine=transform_matrix[0], device=device)["total_cd"]
+			cd_template += nb * evaluate(mean_coord, target_coord, mean_labels, target_labels, batch_size=nb, affine=transform_matrix[0], device=device)["total_cd"]
+			n += nb
+	for m, momentum in zip(bns, saved):
+		m.momentum = momentum
+	return loss / n, cd / n, cd_template / n
+
 if not args.eval_only:
+	select = "val_loss" if val_loader is not None else "train_loss"
 	best_loss = float("inf")
 	total_epoch = args.epochs
-	loss_epoch = np.zeros((total_epoch,), dtype=np.float32)
-	model.train()
+	history = []
 	early_stop_counter = 0
 	for epoch in range(1,total_epoch+1):
-		print(f"Epoch {epoch}/{total_epoch}")
+		model.train()
 		avg_loss = 0.0
-		for i, (body_coord, body_offset, mean_coord, mean_labels, mean_offset, target_coord, target_labels, target_offset, transform_matrix, patient_path) in enumerate(tqdm(train_loader)): 
+		for i, (body_coord, body_offset, mean_coord, mean_labels, mean_offset, target_coord, target_labels, target_offset, transform_matrix, patient_path) in enumerate(tqdm(train_loader, desc=f"Epoch {epoch}/{total_epoch}", leave=False, disable=not sys.stderr.isatty())): 
 			body_coord, body_offset = body_coord.to(device), body_offset.to(device)
 			mean_coord, mean_labels, mean_offset = mean_coord.to(device), mean_labels.to(device), mean_offset.to(device)
 			target_coord, target_labels = target_coord.to(device), target_labels.to(device)
@@ -317,31 +378,58 @@ if not args.eval_only:
 			avg_loss += loss.item()
 	
 		avg_loss /= len(train_loader)
-		print(f"Avg Loss - {avg_loss:.6f}")
-		loss_epoch[epoch-1] = avg_loss
-		if avg_loss <= best_loss:
-			print("New best result")
-			best_loss = avg_loss
+		row = {"epoch": epoch, "lr": optimizer.param_groups[0]["lr"], "train_loss": avg_loss}
+		line = f"Epoch {epoch}/{total_epoch} | lr {row['lr']:.2e} | Avg Loss - {avg_loss:.6f}"
+		if val_loader is not None:
+			row["val_loss"], row["val_cd_mm"], row["val_template_cd_mm"] = monitor(val_loader)
+			line += (f" | val loss {row['val_loss']:.6f} | val CD {row['val_cd_mm']:.3f} mm"
+					 f" (template {row['val_template_cd_mm']:.3f} mm)")
+		if args.monitor_test:
+			row["test_loss"], row["test_cd_mm"], row["template_cd_mm"] = monitor(test_loader)
+			line += (f" | test loss {row['test_loss']:.6f} | test CD {row['test_cd_mm']:.3f} mm"
+					 f" (template {row['template_cd_mm']:.3f} mm)")
+		if row[select] <= best_loss:
+			best_loss = row[select]
+			best_epoch = epoch
 			torch.save(model.state_dict(), f"{model_save_path}/model_weights_best.pth")
 			early_stop_counter = 0
+			line += " | New best result"
 		else:
 			early_stop_counter += 1
-			print(f"Best loss remains - {best_loss:.6f} - Early stop counter: {early_stop_counter}")
-	
-		if early_stop_counter >= 6:
+			line += f" | Early stop counter: {early_stop_counter}"
+		print(line, flush=True)
+		history.append(row)
+		pd.DataFrame(history).to_csv(f"{csv_save_path}/loss_history.csv", index=False)
+
+		if args.patience and early_stop_counter >= args.patience:
 			print("Early stopping triggered.")
 			break
 		
 		scheduler.step()
 
 	torch.save(model.state_dict(), f"{model_save_path}/model_weights_last.pth")
+	print(f"Best checkpoint: epoch {best_epoch} ({select} {best_loss:.6f})")
+	with open(f"{csv_save_path}/best_epoch.txt", "w") as f:
+		f.write(f"{best_epoch} {select} {best_loss:.8f}\n")
 
-	fig = plt.figure(figsize=(8,8))
-	ax = fig.add_subplot(111)
-	ax.plot(loss_epoch)
-	ax.set_title("Running Loss over Epoch")
-	ax.set_xlabel("Epoch")
-	ax.set_ylabel("CD Loss")
+	hist = pd.DataFrame(history)
+	fig, ax = plt.subplots(1, 2 if args.monitor_test else 1, figsize=(14 if args.monitor_test else 8, 6), squeeze=False)
+	ax[0, 0].plot(hist.epoch, hist.train_loss, label="train")
+	if "val_loss" in hist:
+		ax[0, 0].plot(hist.epoch, hist.val_loss, label="validation")
+		ax[0, 0].axvline(best_epoch, color="0.5", linestyle=":", linewidth=1)
+	if args.monitor_test:
+		ax[0, 0].plot(hist.epoch, hist.test_loss, label="test")
+		ax[0, 1].plot(hist.epoch, hist.test_cd_mm, label="model (test)")
+		ax[0, 1].plot(hist.epoch, hist.template_cd_mm, "--", label="template (test)")
+		ax[0, 1].set_xlabel("Epoch")
+		ax[0, 1].set_ylabel("CD (mm)")
+		ax[0, 1].legend()
+	ax[0, 0].set_yscale("log")
+	ax[0, 0].set_title("Running Loss over Epoch")
+	ax[0, 0].set_xlabel("Epoch")
+	ax[0, 0].set_ylabel("CD Loss")
+	ax[0, 0].legend()
 	plt.savefig(f"{fig_save_path}/Running Loss")
 
 import pandas as pd

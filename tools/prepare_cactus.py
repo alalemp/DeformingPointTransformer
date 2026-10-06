@@ -1,16 +1,28 @@
 """Build DeformingPointTransformer inputs from the Houdini cactus-pose arm simulations.
 
-Expected layout under --data (as written by export_cactus_pose_ply_mirrored_tree.py):
-  final skins for 45th and 56th frames/<subject>/final_skin.<frame:05d>.ply
-  entire muscles for 45th and 56th frames/<subject>/entire_muscles.<frame:05d>.ply
-Subject folder names carry the simulation parameters, e.g. BB_0.6_TRL_-0.6_TRM_0.6_TRLN_-0.6_T_1;
-they are parsed into subjects.csv. Skin and muscle meshes may differ in topology per subject.
+Two export layouts under --data are recognised automatically:
+
+  "separated" (current export, /data/aalempij/data/datasets_cactus_pose; frames 160, 220):
+    final skin/<subject>/final_skin.<frame:05d>.ply
+    separated muscles/<Muscle>/<group>/<Muscle>.<frame:05d>.ply   (one closed mesh per muscle, both arms)
+    bones/bones.<frame:05d>.ply
+  "entire" (first export, datasets_cactus_poses; frames 45, 56):
+    final skins for 45th and 56th frames/<subject>/final_skin.<frame:05d>.ply
+    entire muscles for 45th and 56th frames/<subject>/entire_muscles.<frame:05d>.ply  (muscles by 'piece')
+    bones for 45th and 56th frames/bones/v1/bones_v1.<frame:04d>.ply
+
+Subject folder names carry the simulation parameters, e.g. BB_0.6_TRL_-0.6_TRM_0_TRLN_-0.6_T_1.25;
+they are parsed into subjects.csv. In the separated layout the muscles depend only on BB/TRL/TRM/TRLN:
+the muscle folder (the "group") is the subject name without _T_<value>, and the skins of one group
+(different T) share the same muscles. Splits and folds are therefore made by GROUP: every skin
+variant and both arms of a group are on the same side, so a test muscle shape is never seen in
+training. Skin and muscle meshes may differ in topology per subject.
 
 Per arm sample:
   input   skin within --crop_mm of a fixed reference position of the target muscles
           (taken once from --reference, so the crop never depends on the sample's own
           muscles), --n_body points sampled uniformly by area
-  target  each target muscle piece (--pieces), --n_organ points sampled uniformly by area
+  target  each target muscle (--muscles / --pieces), --n_organ points sampled uniformly by area
 The left arm is mirrored (x -> -x) onto the right, so --arms both gives two samples per
 subject; both arms of a subject always go to the same split.
 
@@ -30,8 +42,13 @@ automatically (the bone component closest to the target muscles, per arm) and bo
 share one topology. Evaluation mm stay in each subject's own space (the per-sample affine undoes
 the alignment). --bone_file may contain {subject} and {frame} for per-subject skeletons.
 
-Leave-N-out (--leave_out N): subjects are shuffled and split into folds of N subjects (both arms
-of a subject stay together). Each fold gets folds/fold_XX/{train.txt, test.txt, mean_shape.npz},
+Validation (--val_frac F): in every split (each fold, or the single split) a fraction F of the
+non-test groups is held out as val.txt; main.py then picks its checkpoint (and early-stops) on the
+validation loss. Train / validation / test never share a group, and the template is built from the
+training groups only. Leave-one-group-out with --val_frac 0.1: test 1 group, validation 5, train 43.
+
+Leave-N-out (--leave_out N): groups are shuffled and split into folds of N groups (all skins and
+both arms of a group stay together; in the old layout a group is one subject). Each fold gets folds/fold_XX/{train.txt, test.txt, mean_shape.npz},
 with the template built from that fold's training subjects; data.npz, affines.npz and labels are
 shared. Run all folds with tools/run_folds.py. The crop / normalisation reference is one fixed
 subject for all folds (--reference, default the first subject); in the fold where it is a test
@@ -43,8 +60,10 @@ Outputs in --out (same formats as prepare_totalseg_mri.py, for main.py):
   data.npz, affines.npz, labels/, folds/fold_XX/..., subjects.csv, qc.png   (--leave_out N)
 
 Usage:
-  python tools/prepare_cactus.py --data /data/aalempij/data/datasets_cactus_poses --out data/cactus45
-  python tools/prepare_cactus.py --out data/cactus45_loo --leave_out 1     # leave-one-subject-out
+  python tools/prepare_cactus.py --out data/cactus160                      # single split, frame 160
+  python tools/prepare_cactus.py --out data/cactus160_loo --leave_out 1    # leave-one-group-out (49 folds)
+  python tools/prepare_cactus.py --out data/cactus220_loo --leave_out 1 --frame 220
+  python tools/prepare_cactus.py --data /data/aalempij/data/datasets_cactus_poses --out data/cactus45  # old export
 """
 import argparse
 import csv
@@ -65,12 +84,22 @@ from skimage import measure
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from prepare_totalseg_mri import GRID_SHAPE, largest_cc, sample_surface, write_csv  # noqa: E402
 
-SKIN_DIR = "final skins for 45th and 56th frames"
-MUSCLE_DIR = "entire muscles for 45th and 56th frames"
-# name:right_piece:left_piece in the 'piece' attribute of entire_muscles (checked on the v1 export:
-# these pieces change most when BB / TRL / TRM / TRLN are varied)
+DATA = "/data/aalempij/data/datasets_cactus_pose"
+LAYOUTS = {
+    "separated": {"skin": "final skin/{subject}/final_skin.{frame:05d}.ply",
+                  "muscle": "separated muscles/{folder}/{group}/{folder}.{frame:05d}.ply",
+                  "bone": "bones/bones.{frame:05d}.ply", "frame": 160},
+    "entire": {"skin": "final skins for 45th and 56th frames/{subject}/final_skin.{frame:05d}.ply",
+               "muscle": "entire muscles for 45th and 56th frames/{subject}/entire_muscles.{frame:05d}.ply",
+               "bone": "bones for 45th and 56th frames/bones/v1/bones_v1.{frame:04d}.ply", "frame": 45},
+}
+# separated layout: name:folder of each target muscle under "separated muscles"
+DEFAULT_MUSCLES = ("biceps_brachii:bicepsBrachialis,triceps_lateral:tricepsLateralis,"
+                   "triceps_medial:tricepsMedialis,triceps_long:tricepsLongus")
+# entire layout: name:right_piece:left_piece in the 'piece' attribute of entire_muscles (checked on
+# the v1 export: these pieces change most when BB / TRL / TRM / TRLN are varied)
 DEFAULT_PIECES = "biceps_brachii:5:104,triceps_lateral:94:193,triceps_medial:96:195,triceps_long:95:194"
-BONE_FILE = "bones for 45th and 56th frames/bones/v1/bones_v1.{frame:04d}.ply"
+BONE_FILE = LAYOUTS["entire"]["bone"]  # kept for older imports
 PITCH = 0.0015  # voxel size (m) for the mean-shape occupancy grid
 
 
@@ -113,14 +142,62 @@ def xyz(v):
     return np.c_[v["x"], v["y"], v["z"]].astype(np.float64)
 
 
-def find_subjects(data, frame):
+def detect_layout(data):
+    return "separated" if os.path.isdir(os.path.join(data, "separated muscles")) else "entire"
+
+
+def group_of(subject, layout):
+    """Muscle configuration of a subject: the name without _T_<value> (separated layout)."""
+    return re.sub(r"_T_[^_]+$", "", subject) if layout == "separated" else subject
+
+
+def parse_muscles(spec, layout):
+    """[(name, folder)] (separated) or [(name, right_piece, left_piece)] (entire)."""
+    if layout == "separated":
+        return [tuple(m.split(":")) for m in spec.split(",")]
+    return [(n, int(r), int(l)) for n, r, l in (p.split(":") for p in spec.split(","))]
+
+
+def find_subjects(data, frame, layout, muscles):
+    """[{subject, group, skin, muscles}] with every file present; muscles is a path per muscle name
+    (separated) or the path of entire_muscles (entire)."""
+    lay = LAYOUTS[layout]
+    skin_root = os.path.join(data, lay["skin"].split("/")[0])
     subs = []
-    for s in sorted(os.listdir(os.path.join(data, SKIN_DIR))):
-        skin = os.path.join(data, SKIN_DIR, s, f"final_skin.{frame:05d}.ply")
-        musc = os.path.join(data, MUSCLE_DIR, s, f"entire_muscles.{frame:05d}.ply")
-        if os.path.isfile(skin) and os.path.isfile(musc):
-            subs.append((s, skin, musc))
+    for s in sorted(os.listdir(skin_root)):
+        g = group_of(s, layout)
+        skin = os.path.join(data, lay["skin"].format(subject=s, frame=frame))
+        if layout == "separated":
+            musc = {m[0]: os.path.join(data, lay["muscle"].format(folder=m[1], group=g, frame=frame)) for m in muscles}
+            ok = all(map(os.path.isfile, musc.values()))
+        else:
+            musc = os.path.join(data, lay["muscle"].format(subject=s, frame=frame))
+            ok = os.path.isfile(musc)
+        if os.path.isfile(skin) and ok:
+            subs.append({"subject": s, "group": g, "skin": skin, "muscles": musc})
     return subs
+
+
+def load_muscles(sub, arm, layout, muscles):
+    """{name: (verts, faces)} of one arm in the right-arm frame (left arm mirrored, x -> -x).
+    Separated meshes hold both arms: the right arm is the part at x > 0."""
+    out = {}
+    if layout == "separated":
+        for name, _ in muscles:
+            v, f = read_ply(sub["muscles"][name])
+            v = xyz(v)
+            side = v[f].mean(1)[:, 0] > 0
+            f = f[side if arm == "R" else ~side]
+            if not len(f):
+                raise ValueError(f"{sub['subject']}: no {name} faces on the {arm} arm")
+            out[name] = (v if arm == "R" else mirror(v), f)
+    else:
+        mv, mf = read_ply(sub["muscles"], props=("x", "y", "z", "piece"))
+        v, piece = xyz(mv), np.asarray(mv["piece"])
+        v = v if arm == "R" else mirror(v)
+        for name, right, left in muscles:
+            out[name] = organ_points(v, piece, mf, right if arm == "R" else left)
+    return out
 
 
 def parse_params(name):
@@ -236,8 +313,10 @@ def occupancy(verts, faces, grid_origin, grid_shape, rng=None):
 class Frame:
     """Fixed crop, normalisation and voxel grid, all from the reference subject's right arm."""
 
-    def __init__(self, ref_skin, ref_mpts, ref_mpiece, pieces, crop_m):
-        self.ref = np.concatenate([ref_mpts[ref_mpiece == r] for _, r, _ in pieces])
+    def __init__(self, ref_skin, ref_muscles, crop_m):
+        """ref_muscles: {name: (verts, faces)} of the reference subject's right arm."""
+        used = {n: v[np.unique(f)] for n, (v, f) in ref_muscles.items()}
+        self.ref = np.concatenate(list(used.values()))
         self.tree = cKDTree(self.ref)
         self.crop_m = crop_m
         region = ref_skin[self.tree.query(ref_skin, distance_upper_bound=crop_m)[0] < crop_m]
@@ -246,7 +325,7 @@ class Frame:
         self.scale = (hi - lo).max() / 2 * 1.05
         self.grid_origin = self.ref.min(0) - 0.03
         self.grid_shape = tuple(np.ceil((self.ref.max(0) + 0.03 - self.grid_origin) / PITCH).astype(int))
-        self.ref_centroids = {name: ref_mpts[ref_mpiece == r].mean(0) for name, r, _ in pieces}
+        self.ref_centroids = {n: p.mean(0) for n, p in used.items()}
         self.humerus_idx, self.humerus_ref, self.bone_n = {}, {}, None
 
     def set_bone(self, bone, faces):
@@ -278,14 +357,13 @@ class Frame:
 
 # ----------------------------------------------------------------------------- per sample
 def build_one(job):
-    sid, subject, arm, skin_path, musc_path, frame, pieces, args, train = job
+    sid, sub, arm, frame, muscles, args, train = job
+    subject = sub["subject"]
     rng = np.random.default_rng([args.seed, zlib.crc32(f"{subject}_{arm}".encode())])
-    sv, sf = read_ply(skin_path)
-    mv, mf = read_ply(musc_path, props=("x", "y", "z", "piece"))
-    skin, mpts, mpiece = xyz(sv), xyz(mv), np.asarray(mv["piece"])
-    if arm == "L":
-        skin, mpts = mirror(skin), mirror(mpts)
-    qc = {"id": sid, "subject": subject, "arm": arm}
+    sv, sf = read_ply(sub["skin"])
+    skin = xyz(sv) if arm == "R" else mirror(xyz(sv))
+    organs = load_muscles(sub, arm, args.layout, muscles)
+    qc = {"id": sid, "subject": subject, "group": sub["group"], "arm": arm}
     align = np.eye(4)
     if args.align == "bone":
         bv, _ = read_ply(os.path.join(args.data, args.bone_file.format(subject=subject, frame=args.frame)))
@@ -294,7 +372,8 @@ def build_one(job):
             raise ValueError(f"{sid}: bone mesh has {len(bone)} vertices, reference has {frame.bone_n}")
         humerus = bone[frame.humerus_idx[arm]]
         align = similarity_transform(humerus, frame.humerus_ref[arm])
-        skin, mpts = apply(align, skin), apply(align, mpts)
+        skin = apply(align, skin)
+        organs = {n: (apply(align, v), f) for n, (v, f) in organs.items()}
         qc["humerus_length_mm"] = round(humerus_length(humerus) * args.to_mm, 1)
         qc["align_scale"] = round(float(np.cbrt(np.linalg.det(align[:3, :3]))), 4)
         qc["align_shift_mm"] = round(float(np.linalg.norm(apply(align, humerus) - humerus, axis=1).mean()) * args.to_mm, 2)
@@ -305,8 +384,7 @@ def build_one(job):
     out = {"input_points": frame.normalise(sample_surface(v, f, args.n_body, rng))}
     qc["skin_crop_vertices"] = int(keep.sum())
     occ = {}
-    for name, right, left in pieces:
-        v, f = organ_points(mpts, mpiece, mf, right if arm == "R" else left)
+    for name, (v, f) in organs.items():
         used = np.unique(f)
         qc[f"{name}_centroid_shift_mm"] = round(float(np.linalg.norm(v[used].mean(0) - frame.ref_centroids[name])) * 1000, 1)
         out[name] = frame.normalise(sample_surface(v, f, args.n_organ, rng))
@@ -382,68 +460,79 @@ def qc_plot(path, data, mean_pc, mean_lab, sid, names):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--data", default="/data/aalempij/data/datasets_cactus_poses")
+    ap.add_argument("--data", default=DATA)
     ap.add_argument("--out", required=True)
-    ap.add_argument("--frame", type=int, default=45)
-    ap.add_argument("--pieces", default=DEFAULT_PIECES, help="name:right_piece:left_piece,...")
+    ap.add_argument("--frame", type=int, help="default 160 (separated layout) / 45 (entire layout)")
+    ap.add_argument("--muscles", default=DEFAULT_MUSCLES, help="separated layout: name:folder,...")
+    ap.add_argument("--pieces", default=DEFAULT_PIECES, help="entire layout: name:right_piece:left_piece,...")
     ap.add_argument("--label_set", default="arm4", help="labels/label_organs_<label_set>.json")
     ap.add_argument("--arms", choices=["right", "left", "both"], default="both")
     ap.add_argument("--crop_mm", type=float, default=100, help="skin kept within this distance of the target muscles")
     ap.add_argument("--n_body", type=int, default=16384)
     ap.add_argument("--n_organ", type=int, default=4096)
     ap.add_argument("--reference", help="subject defining crop / normalisation (default: first training subject)")
-    ap.add_argument("--test_frac", type=float, default=0.2)
-    ap.add_argument("--test_subjects", nargs="*", help="explicit test subjects (overrides --test_frac)")
+    ap.add_argument("--test_frac", type=float, default=0.2, help="fraction of groups held out (single split)")
+    ap.add_argument("--test_subjects", nargs="*",
+                    help="explicit test subjects or groups (overrides --test_frac); their whole groups are held out")
     ap.add_argument("--align", choices=["none", "bone"], default="none",
                     help="bone: map each arm onto the reference humerus (similarity transform) first")
-    ap.add_argument("--bone_file", default=BONE_FILE,
-                    help="bone mesh relative to --data; may use {subject} and {frame}")
+    ap.add_argument("--bone_file", help="bone mesh relative to --data; may use {subject} and {frame} "
+                                        "(default: the layout's shared skeleton)")
     ap.add_argument("--leave_out", type=int, default=0,
-                    help="N > 0: leave-N-subjects-out folds instead of one split (1 = leave-one-out)")
+                    help="N > 0: leave-N-groups-out folds instead of one split (1 = leave-one-group-out)")
+    ap.add_argument("--val_frac", type=float, default=0.0,
+                    help="fraction of the non-test groups held out for validation (checkpoint selection), "
+                         "drawn separately for every fold; 0 = no validation set")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--max_shift_mm", type=float, default=50,
-                    help="fail if a muscle centroid is further than this from the reference (piece ids changed?)")
+                    help="fail if a muscle centroid is further than this from the reference (wrong muscle?)")
     ap.add_argument("--to_mm", type=float, default=1000, help="mesh units -> mm (Houdini export is in metres)")
     ap.add_argument("--workers", type=int, default=8)
     args = ap.parse_args()
 
-    pieces = [(n, int(r), int(l)) for n, r, l in (p.split(":") for p in args.pieces.split(","))]
-    names = [n for n, _, _ in pieces]
-    subs = find_subjects(args.data, args.frame)
+    args.layout = detect_layout(args.data)
+    args.frame = args.frame if args.frame is not None else LAYOUTS[args.layout]["frame"]
+    args.bone_file = args.bone_file or LAYOUTS[args.layout]["bone"]
+    muscles = parse_muscles(args.muscles if args.layout == "separated" else args.pieces, args.layout)
+    names = [m[0] for m in muscles]
+    subs = find_subjects(args.data, args.frame, args.layout, muscles)
     if not subs:
-        raise SystemExit(f"no subjects with both skin and muscles for frame {args.frame} under {args.data}")
+        raise SystemExit(f"no subjects with skin and all muscles for frame {args.frame} under {args.data}")
     os.makedirs(os.path.join(args.out, "labels"), exist_ok=True)
 
-    # split by subject so both arms of one subject are on the same side
-    names_sub = [s for s, _, _ in subs]
+    # split by group, so all skins (T variants) and both arms of one muscle configuration are together
+    names_sub = [x["subject"] for x in subs]
+    group = {x["subject"]: x["group"] for x in subs}
+    groups = sorted(set(group.values()))
+    print(f"{args.layout} layout, frame {args.frame}: {len(subs)} subjects in {len(groups)} muscle groups")
     if args.leave_out:
-        perm = list(np.random.default_rng(args.seed).permutation(names_sub))
+        perm = list(np.random.default_rng(args.seed).permutation(groups))
         folds = [perm[i:i + args.leave_out] for i in range(0, len(perm), args.leave_out)]
         if len(folds) < 2:
-            raise SystemExit(f"--leave_out {args.leave_out} leaves no training subjects ({len(perm)} subjects)")
+            raise SystemExit(f"--leave_out {args.leave_out} leaves no training groups ({len(perm)} groups)")
         test = set()
     elif args.test_subjects:
-        test = set(args.test_subjects)
-        missing = test - set(names_sub)
+        test = {group.get(t, t) for t in args.test_subjects}
+        missing = test - set(groups)
         if missing:
-            raise SystemExit(f"unknown test subjects: {sorted(missing)}")
+            raise SystemExit(f"unknown test subjects / groups: {sorted(missing)}")
     else:
-        perm = np.random.default_rng(args.seed).permutation(names_sub)
+        perm = np.random.default_rng(args.seed).permutation(groups)
         test = set(perm[:max(1, int(round(args.test_frac * len(perm))))])
-    split = {s: "test" if s in test else "train" for s in names_sub}
+    split = {s: "test" if group[s] in test else "train" for s in names_sub}
     if args.leave_out:
-        split = {s: f"fold_{k:02d}" for k, fold in enumerate(folds) for s in fold}
+        fold_of = {g: f"fold_{k:02d}" for k, fold in enumerate(folds) for g in fold}
+        split = {s: fold_of[group[s]] for s in names_sub}
         ref = args.reference or names_sub[0]
-        print(f"{len(subs)} subjects in {len(folds)} folds of up to {args.leave_out}, reference {ref}")
+        print(f"{len(folds)} folds of up to {args.leave_out} groups, reference {ref}")
     else:
         ref = args.reference or next(s for s in names_sub if split[s] == "train")
-        print(f"{len(subs)} subjects (train {sum(v == 'train' for v in split.values())}, test {len(test)}), "
-              f"reference {ref}")
+        print(f"train {sum(v == 'train' for v in split.values())} / test {sum(v == 'test' for v in split.values())} "
+              f"subjects ({len(test)} test groups), reference {ref}")
 
-    _, ref_skin_path, ref_musc_path = next(x for x in subs if x[0] == ref)
-    sv, _ = read_ply(ref_skin_path)
-    mv, _ = read_ply(ref_musc_path, props=("x", "y", "z", "piece"))
-    frame = Frame(xyz(sv), xyz(mv), np.asarray(mv["piece"]), pieces, args.crop_mm / args.to_mm)
+    ref_sub = next(x for x in subs if x["subject"] == ref)
+    sv, _ = read_ply(ref_sub["skin"])
+    frame = Frame(xyz(sv), load_muscles(ref_sub, "R", args.layout, muscles), args.crop_mm / args.to_mm)
     if args.align == "bone":
         bv, bf = read_ply(os.path.join(args.data, args.bone_file.format(subject=ref, frame=args.frame)))
         frame.set_bone(xyz(bv), bf)
@@ -454,7 +543,8 @@ def main():
 
     arms = {"right": ["R"], "left": ["L"], "both": ["R", "L"]}[args.arms]
     # occupancy is needed for every sample that is a training sample in some split
-    jobs = [(f"{s}_{a}", s, a, sk, mu, frame, pieces, args, split[s] != "test") for s, sk, mu in subs for a in arms]
+    jobs = [(f"{x['subject']}_{a}", x, a, frame, muscles, args, split[x["subject"]] != "test")
+            for x in subs for a in arms]
 
     data, affines, qcs = {}, {}, []
     occ_total = {n: np.zeros(frame.grid_shape, np.float32) for n in names}
@@ -481,19 +571,26 @@ def main():
                   flush=True)
             if shift > args.max_shift_mm:
                 raise SystemExit(f"{sid}: a muscle is {shift} mm from the reference position - "
-                                 f"are the --pieces ids still right for this export?")
+                                 f"are --muscles / --pieces right for this export?")
 
     ids = sorted(affines)
     qcs.sort(key=lambda q: q["id"])
     subject_of = {i: i.rsplit("_", 1)[0] for i in ids}
 
-    def write_split(d, test_subjects):
-        """train.txt / test.txt and the template from the training samples, into directory d."""
+    def write_split(d, test_groups, split_seed=0):
+        """train.txt / test.txt (/ val.txt with --val_frac) and the template from the training samples
+        only, into directory d. Validation groups are drawn from the non-test groups."""
         os.makedirs(d, exist_ok=True)
-        train_ids = [i for i in ids if subject_of[i] not in test_subjects]
-        test_ids = [i for i in ids if subject_of[i] in test_subjects]
-        occ_sum = {n: occ_total[n].copy() for n in names}  # total minus the held-out samples
-        for i in test_ids:
+        rest = sorted({group[subject_of[i]] for i in ids} - set(test_groups))
+        n_val = int(round(args.val_frac * len(rest))) if args.val_frac > 0 else 0
+        if args.val_frac > 0:
+            n_val = max(1, n_val)
+        val_groups = set(np.random.default_rng([args.seed, 1, split_seed]).permutation(rest)[:n_val])
+        train_ids = [i for i in ids if group[subject_of[i]] not in test_groups and group[subject_of[i]] not in val_groups]
+        val_ids = [i for i in ids if group[subject_of[i]] in val_groups]
+        test_ids = [i for i in ids if group[subject_of[i]] in test_groups]
+        occ_sum = {n: occ_total[n].copy() for n in names}  # total minus the held-out (test + val) samples
+        for i in test_ids + val_ids:
             if i in occ_packed:
                 for n in names:
                     occ_sum[n] -= unpack(occ_packed[i][n], frame.grid_shape)
@@ -501,7 +598,9 @@ def main():
         mean_pc, mean_lab, mesh = mean_template(occ_sum, len(train_ids), vols, frame, names, args.n_organ,
                                                 np.random.default_rng(args.seed))
         np.savez(os.path.join(d, "mean_shape.npz"), mean_pc_np=mean_pc, mean_label_np=mean_lab, **mesh)
-        for s, lst in (("train", train_ids), ("test", test_ids)):
+        for s, lst in (("train", train_ids), ("val", val_ids), ("test", test_ids)):
+            if s == "val" and not val_ids:
+                continue
             with open(os.path.join(d, f"{s}.txt"), "w") as f:
                 f.writelines(f"{i}\n" for i in lst)
         return mean_pc, mean_lab, train_ids, test_ids
@@ -513,9 +612,9 @@ def main():
     write_csv(qcs, os.path.join(args.out, "subjects.csv"))
     if args.leave_out:
         for k, fold in enumerate(folds):
-            print(f"fold_{k:02d}: test {', '.join(fold)}")
+            print(f"fold_{k:02d}: test group {', '.join(fold)}")
             mean_pc, mean_lab, train_ids, test_ids = write_split(
-                os.path.join(args.out, "folds", f"fold_{k:02d}"), set(fold))
+                os.path.join(args.out, "folds", f"fold_{k:02d}"), set(fold), split_seed=k)
             if k == 0:
                 first = (mean_pc, mean_lab, train_ids[0])
         print(f"wrote {len(ids)} samples in {len(folds)} folds -> {args.out}/folds")
