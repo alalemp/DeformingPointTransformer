@@ -1,5 +1,18 @@
 data/*
 
+# Generated experiment outputs are regenerated per machine.
+/results/
+/vis/
+*.pth
+*.ckpt
+
+# PBS output logs and machine-local settings.
+/*.o[0-9]*
+/*.e[0-9]*
+.env
+.env.*
+!.env.example
+
 # Ignore Python cache
 __pycache__/
 *.pyc

@@ -1,0 +1,10 @@
+# Use with CONDARC="$PWD/conda-forge.condarc.yml" for environment creation.
+# Disable the commercial default channel URLs, including for pre-command hooks.
+channels:
+  - conda-forge
+default_channels: []
+# Conda 26.7 forwards the old nodefaults sentinel as a channel. Resolve it to
+# no URLs, preserving the original environment.yml without a spurious request.
+custom_multichannels:
+  nodefaults: []
+channel_priority: strict

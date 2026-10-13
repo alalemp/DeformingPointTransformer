@@ -1,0 +1,28 @@
+# UTS arm-only setup. Keeps the guide's Python, PyTorch and CUDA versions.
+# Scientific package versions are resolved within these constraints; save pip freeze
+# with each run. This is not the full MRI environment in environment.yml.
+name: bodyseg
+channels:
+  - conda-forge
+  - nodefaults
+dependencies:
+  - python=3.11
+  - pip
+  - setuptools<81
+  - wheel
+  - gcc_linux-64=12
+  - gxx_linux-64=12
+  - pip:
+      - --extra-index-url https://download.pytorch.org/whl/cu121
+      - torch==2.5.1+cu121
+      - torchvision==0.20.1+cu121
+      - numpy==1.26.4
+      - pandas>=2.2,<3
+      - scipy
+      - scikit-image
+      - nibabel
+      - matplotlib
+      - tqdm
+      - trimesh
+      - h5py
+      - ninja

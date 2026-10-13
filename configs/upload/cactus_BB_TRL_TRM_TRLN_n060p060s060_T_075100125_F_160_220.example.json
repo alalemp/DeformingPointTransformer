@@ -1,0 +1,79 @@
+{
+  "dataset_code": "cactus_BB_TRL_TRM_TRLN_n060p060s060_T_075100125_F_160_220",
+  "pose": "cactus",
+  "frames": [
+    160,
+    220
+  ],
+  "muscle_parameters": {
+    "BB": {
+      "mesh_folder": "bicepsBrachialis",
+      "values": [
+        -0.6,
+        0.0,
+        0.6
+      ],
+      "min": -0.6,
+      "max": 0.6,
+      "step": 0.6
+    },
+    "TRL": {
+      "mesh_folder": "tricepsLateralis",
+      "values": [
+        -0.6,
+        0.0,
+        0.6
+      ],
+      "min": -0.6,
+      "max": 0.6,
+      "step": 0.6
+    },
+    "TRM": {
+      "mesh_folder": "tricepsMedialis",
+      "values": [
+        -0.6,
+        0.0,
+        0.6
+      ],
+      "min": -0.6,
+      "max": 0.6,
+      "step": 0.6
+    },
+    "TRLN": {
+      "mesh_folder": "tricepsLongus",
+      "values": [
+        -0.6,
+        0.0,
+        0.6
+      ],
+      "min": -0.6,
+      "max": 0.6,
+      "step": 0.6
+    }
+  },
+  "tissue_thickness_ratio": {
+    "parameter": "T",
+    "values": [
+      0.75,
+      1.0,
+      1.25
+    ],
+    "min": 0.75,
+    "max": 1.25,
+    "step": 0.25
+  },
+  "code_legend": {
+    "cactus": "cactus pose",
+    "BB_TRL_TRM_TRLN": "explicit muscle parameter identifiers, in this order",
+    "n060p060s060": "shared minimum -0.60, maximum +0.60, step 0.60; numeric codes scaled by 100",
+    "T_075100125": "tissue thickness ratios 0.75, 1.00 and 1.25",
+    "F_160_220": "frames 160 and 220"
+  },
+  "muscle_groups": 81,
+  "skin_models_per_frame": 243,
+  "arm_samples_per_frame": 486,
+  "original_file_count": 1301,
+  "original_bytes": 24696948796,
+  "local_source": "/mnt/d/Houdini_Models/Ranxi_Models/practice/datasets/datasets_20260926/datasets_cactus pose frames_ply",
+  "cetus_destination": "/shared/homes/u24615736/datasets/houdini/cactus_BB_TRL_TRM_TRLN_n060p060s060_T_075100125_F_160_220/"
+}
