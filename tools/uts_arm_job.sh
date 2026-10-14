@@ -85,7 +85,28 @@ for fold in folds:
     if len(ids) < 4:
         raise SystemExit(f'{fold}: batch size 4 needs at least 4 training arms; got {len(ids)}')
 PY
-    git -C "$REPO" rev-parse HEAD > "results/$RUN_NAME/source_commit.txt"
+    # Compute nodes may not provide Git; read the shared checkout metadata instead.
+    python - "$REPO" > "results/$RUN_NAME/source_commit.txt" <<'PY'
+import sys
+from pathlib import Path
+gitdir = Path(sys.argv[1]) / '.git'
+try:
+    head = (gitdir / 'HEAD').read_text().strip()
+    if head.startswith('ref: '):
+        ref = head[5:]
+        loose = gitdir / ref
+        if loose.is_file():
+            head = loose.read_text().strip()
+        else:
+            head = next(line.split()[0] for line in
+                        (gitdir / 'packed-refs').read_text().splitlines()
+                        if line and not line.startswith(('#', '^'))
+                        and line.split()[1] == ref)
+    print(head)
+except (OSError, StopIteration):
+    print('unknown')
+    print('Warning: could not read source commit metadata', file=sys.stderr)
+PY
     python -m pip freeze > "results/$RUN_NAME/pip_freeze.txt"
     python tools/run_folds.py --prepared "data/$PREPARED" --label_set arm4 \
         --save "results/$RUN_NAME" "${fold_args[@]}" \
