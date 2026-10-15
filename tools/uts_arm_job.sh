@@ -14,7 +14,7 @@ if [ "$FOLD" != all ] && ! [[ "$FOLD" =~ ^fold_[0-9]+$ ]]; then
 fi
 PREPARED="cactus${FRAME}_loo_val"
 RUN_NAME="${RUN_NAME:-check${FRAME}}"
-[[ "$RUN_NAME" =~ ^[A-Za-z0-9_-]+$ ]] || { echo "Invalid RUN_NAME" >&2; exit 1; }
+[[ "$RUN_NAME" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]*$ ]] || { echo "Invalid RUN_NAME" >&2; exit 1; }
 source "$REPO/cluster_env_uts.sh"
 DATASET_CODE="${DATASET_CODE:-cactus_BB_TRL_TRM_TRLN_n060p060s060_T_075100125_F_160_220}"
 [[ "$DATASET_CODE" =~ ^[A-Za-z0-9_.-]+$ ]] || { echo "Invalid DATASET_CODE" >&2; exit 1; }

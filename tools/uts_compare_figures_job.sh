@@ -12,9 +12,9 @@ for config in neg zero pos; do
     esac
     python -u tools/paper_figures.py \
         --data "$RAW" \
-        --run "${config}=data/cactus${FRAME}_loo_val:results/compare${FRAME}_${config}:${FRAME}" \
+        --run "${config}=data/cactus${FRAME}_loo_val:results/compare${FRAME}_${group}:${FRAME}" \
         --sample "${group}_T_1_R" \
-        --out "figures/parameter_comparison${FRAME}/${config}" \
+        --out "figures/parameter_comparison${FRAME}/${group}" \
         --only error --error_max_mm 10
 done
 # Include every completed comparison, preserving signed volume errors.
@@ -22,9 +22,10 @@ python - <<'PY'
 from pathlib import Path
 import pandas as pd
 rows = []
+groups = {'neg': 'BB_-0.6_TRL_-0.6_TRM_-0.6_TRLN_-0.6', 'zero': 'BB_0_TRL_0_TRM_0_TRLN_0', 'pos': 'BB_0.6_TRL_0.6_TRM_0.6_TRLN_0.6'}
 for frame in (160, 220):
     for config in ('neg', 'zero', 'pos'):
-        root = Path(f'results/compare{frame}_{config}')
+        root = Path(f'results/compare{frame}_{groups[config]}')
         if not (root / 'summary_arm4.csv').is_file():
             continue
         summary = pd.read_csv(root / 'summary_arm4.csv')

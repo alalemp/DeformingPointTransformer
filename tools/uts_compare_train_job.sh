@@ -24,6 +24,6 @@ if len(matches) != 1:
 print(matches[0])
 PY
 )
-export MODE=train FRAME FOLD RUN_NAME="compare${FRAME}_${CONFIG}"
+export MODE=train FRAME FOLD RUN_NAME="compare${FRAME}_${GROUP}"
 echo "Matched $GROUP to $FOLD, frame $FRAME"
 exec bash tools/uts_arm_job.sh

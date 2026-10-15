@@ -3,6 +3,11 @@ data/*
 # Generated experiment outputs are regenerated per machine.
 /results/
 /vis/
+# Generated comparison and small-dataset figures (keep source plotting tools).
+/figures/parameter_comparison*/
+/figures/paper_comparison*/
+/figures/small_paper/
+/figures/small_paper_comparison*/
 *.pth
 *.ckpt
 
